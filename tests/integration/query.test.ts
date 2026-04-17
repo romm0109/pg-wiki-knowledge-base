@@ -391,6 +391,144 @@ describe('query integration', () => {
       client.listPages({ limit: 1.5 } as { limit: number })
     ).rejects.toThrow('Invalid pagination options');
   });
+
+  it('query returns matched pages and evidence', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const ingested = await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript. It adds static types to JS.',
+      type: 'text',
+    });
+
+    const result = await client.query('typed superset', {});
+
+    expect(result.pages.length).toBeGreaterThanOrEqual(1);
+    expect(result.pages[0]).toMatchObject({
+      id: ingested.pages[0].id,
+      title: 'TypeScript',
+      excerpt: expect.stringContaining('typed superset'),
+    });
+    expect(result.evidence.length).toBeGreaterThanOrEqual(1);
+    expect(result.evidence[0].sourceId).toBe(ingested.sourceId);
+  });
+
+  it('query defaults to pages-only mode', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript.',
+      type: 'text',
+    });
+
+    const defaultResult = await client.query('typescript', {});
+    const explicitResult = await client.query('typescript', { mode: 'pages-only' });
+
+    expect(defaultResult.pages.map((page) => page.id)).toEqual(
+      explicitResult.pages.map((page) => page.id)
+    );
+    expect(defaultResult).not.toHaveProperty('answer');
+    expect(explicitResult).not.toHaveProperty('answer');
+  });
+
+  it('query applies metadata filters', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const billing = await client.ingestSource({
+      content: 'BillingMarker shared content for query filtering.',
+      type: 'text',
+    });
+    const support = await client.ingestSource({
+      content: 'SupportMarker shared content for query filtering.',
+      type: 'text',
+    });
+
+    await updatePageMetadata(client, billing.pages[0].id, { project: 'billing' });
+    await updatePageMetadata(client, support.pages[0].id, { project: 'support' });
+
+    const result = await client.query('content', {
+      filters: { project: 'billing' },
+    });
+
+    expect(result.pages).toHaveLength(1);
+    expect(result.pages[0]).toMatchObject({
+      id: billing.pages[0].id,
+      title: 'Billing',
+    });
+    expect(result.evidence.every((row) => row.sourceId === billing.sourceId)).toBe(true);
+  });
+
+  it('query enforces tenant scope', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const tenantClient = await createClient<{ workspaceId: string }>({
+      connectionString: DATABASE_URL,
+      llm: mockLlm,
+      tenant: { key: 'workspaceId' },
+      migrations: { run: false },
+    });
+
+    try {
+      await tenantClient.ingestSource({
+        content: 'TenantAMarker content for tenant scoped query checks.',
+        type: 'text',
+        tenant: { workspaceId: 'a' },
+      });
+      await tenantClient.ingestSource({
+        content: 'TenantBMarker content for tenant scoped query checks.',
+        type: 'text',
+        tenant: { workspaceId: 'b' },
+      });
+
+      const result = await tenantClient.query('content', {
+        tenant: { workspaceId: 'a' },
+      });
+
+      expect(result.pages.map((page) => page.title)).toEqual(['TenantA']);
+    } finally {
+      await tenantClient.dataSource.destroy();
+    }
+  });
+
+  it('query returns empty arrays for no matches and rejects blank input', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript.',
+      type: 'text',
+    });
+
+    await expect(client.query('   ', {})).rejects.toThrow('Invalid query text');
+
+    await expect(client.query('definitely-not-present', {})).resolves.toEqual({
+      pages: [],
+      evidence: [],
+    });
+  });
+
+  it('query rejects unsupported synthesize mode', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript.',
+      type: 'text',
+    });
+
+    await expect(
+      client.query('typescript', { mode: 'synthesize' })
+    ).rejects.toThrow('synthesize mode not implemented');
+  });
 });
 
 async function updatePageMetadata(

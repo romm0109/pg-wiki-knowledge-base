@@ -7,7 +7,13 @@ import {
   SourceFragment,
   Source,
 } from './entities';
-import type { ClientConfig, MetadataFilters, PageDetail, PageSummary } from './types';
+import type {
+  ClientConfig,
+  MetadataFilters,
+  PageDetail,
+  PageSummary,
+  QueryResult,
+} from './types';
 
 export interface QueryContext<TTenant extends Record<string, unknown> = never> {
   dataSource: DataSource;
@@ -26,7 +32,30 @@ type ListPagesOpts<TTenant extends Record<string, unknown>> =
     offset?: number;
   };
 
+type QueryOpts<TTenant extends Record<string, unknown>> =
+  TenantOpts<TTenant> & {
+    filters?: MetadataFilters;
+    mode?: 'pages-only' | 'synthesize';
+  };
+
 type TenantValue = Record<string, unknown> | null;
+
+type QueryMode = 'pages-only' | 'synthesize';
+
+type QueryPageRow = {
+  id: string;
+  title: string;
+  content: string;
+  rank: string;
+};
+
+type QueryEvidenceRow = {
+  fragmentId: string;
+  text: string;
+  sourceId: string;
+  charOffsetStart: string;
+  pageId: string;
+};
 
 function resolveTenantValue<TTenant extends Record<string, unknown>>(
   config: ClientConfig<TTenant>,
@@ -157,6 +186,34 @@ function validateListPagesOptions(limit?: number, offset?: number): void {
   }
 }
 
+function resolveQueryMode(mode?: QueryMode): 'pages-only' {
+  if (mode === 'synthesize') {
+    throw new Error('synthesize mode not implemented');
+  }
+
+  return 'pages-only';
+}
+
+function validateQueryText(text: string): string {
+  const normalizedText = text.trim();
+
+  if (normalizedText.length === 0) {
+    throw new Error('Invalid query text');
+  }
+
+  return normalizedText;
+}
+
+function createExcerpt(content: string, maxLength = 220): string {
+  const normalizedContent = content.trim();
+
+  if (normalizedContent.length <= maxLength) {
+    return normalizedContent;
+  }
+
+  return `${normalizedContent.slice(0, maxLength).trimEnd()}...`;
+}
+
 export async function listPages<TTenant extends Record<string, unknown> = never>(
   ctx: QueryContext<TTenant>,
   opts: ListPagesOpts<TTenant>
@@ -274,6 +331,80 @@ export async function getPage<TTenant extends Record<string, unknown> = never>(
       text: claim.text,
       status: claim.status,
     })),
+    evidence,
+  };
+}
+
+export async function query<TTenant extends Record<string, unknown> = never>(
+  ctx: QueryContext<TTenant>,
+  text: string,
+  opts: QueryOpts<TTenant>
+): Promise<QueryResult> {
+  const normalizedText = validateQueryText(text);
+  resolveQueryMode(opts.mode);
+
+  const tenantValue = resolveTenantValue(ctx.config, opts);
+  const manager = ctx.dataSource.manager;
+  const tsQuery = `websearch_to_tsquery('english', :text)`;
+
+  let pageQuery = manager
+    .createQueryBuilder(WikiPage, 'p')
+    .select('p.id', 'id')
+    .addSelect('p.title', 'title')
+    .addSelect('p.content', 'content')
+    .addSelect(`ts_rank_cd(p.search_vector, ${tsQuery})`, 'rank')
+    .where(`p.search_vector @@ ${tsQuery}`, { text: normalizedText });
+
+  pageQuery = applyPageTenantScope(pageQuery, tenantValue);
+  pageQuery = applyMetadataFilters(pageQuery, opts.filters);
+  pageQuery = pageQuery
+    .orderBy('rank', 'DESC')
+    .addOrderBy('p.title', 'ASC')
+    .addOrderBy('p.id', 'ASC');
+
+  const pageRows = await pageQuery.getRawMany<QueryPageRow>();
+  if (pageRows.length === 0) {
+    return { pages: [], evidence: [] };
+  }
+
+  const pages = pageRows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    excerpt: createExcerpt(row.content),
+  }));
+  const pageIds = pageRows.map((row) => row.id);
+
+  const evidenceRows = await manager
+    .createQueryBuilder(ClaimEvidence, 'ce')
+    .innerJoin(WikiClaim, 'c', 'c.id = ce.claim_id')
+    .innerJoin(SourceFragment, 'sf', 'sf.id = ce.fragment_id')
+    .innerJoin(Source, 's', 's.id = sf.source_id')
+    .select('sf.id', 'fragmentId')
+    .addSelect('sf.text', 'text')
+    .addSelect('s.id', 'sourceId')
+    .addSelect('sf.char_offset_start', 'charOffsetStart')
+    .addSelect('c.page_id', 'pageId')
+    .where('c.page_id IN (:...pageIds)', { pageIds })
+    .orderBy('c.page_id', 'ASC')
+    .addOrderBy('sf.char_offset_start', 'ASC')
+    .addOrderBy('sf.id', 'ASC')
+    .getRawMany<QueryEvidenceRow>();
+
+  const evidence = Array.from(
+    new Map(
+      evidenceRows.map((row) => [
+        row.fragmentId,
+        {
+          fragmentId: row.fragmentId,
+          text: row.text,
+          sourceId: row.sourceId,
+        },
+      ])
+    ).values()
+  );
+
+  return {
+    pages,
     evidence,
   };
 }

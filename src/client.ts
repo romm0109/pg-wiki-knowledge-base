@@ -13,7 +13,7 @@ import {
 } from './entities';
 import { InitialSchema1700000000000 } from './migrations/1700000000000-InitialSchema';
 import { deleteSource, ingestSource, IngestContext } from './ingest';
-import { getPage, listPages, QueryContext } from './query';
+import { getPage, listPages, query, QueryContext } from './query';
 import type {
   ClientConfig,
   MetadataFilters,
@@ -73,9 +73,12 @@ export class Client<TTenant extends Record<string, unknown> = never> {
       mode?: 'pages-only' | 'synthesize';
     } & TenantArg<TTenant>
   ): Promise<QueryResult> {
-    void text;
-    void opts;
-    throw new Error('not implemented');
+    const ctx: QueryContext<TTenant> = {
+      dataSource: this.dataSource,
+      schema: this.schema,
+      config: this._config,
+    };
+    return query(ctx, text, opts);
   }
 
   async listPages(
