@@ -1,0 +1,25 @@
+{
+  "name": "pg-wiki-knowledge-base",
+  "version": "0.1.0",
+  "description": "A Postgres-backed wiki knowledge base library with TypeORM and LLM integration",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "jest",
+    "test:integration": "jest --testPathPattern=integration"
+  },
+  "dependencies": {
+    "reflect-metadata": "^0.2.2",
+    "typeorm": "^0.3.20",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.7.2"
+  }
+}
