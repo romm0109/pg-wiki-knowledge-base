@@ -46,6 +46,16 @@ export function buildIngestPrompt(params: {
   ].join('\n');
 }
 
+export function buildSynthesizeSystemPrompt(): string {
+  return [
+    'You are a helpful assistant with access to a wiki knowledge base.',
+    'Use the provided tools to search and retrieve relevant wiki content before answering.',
+    'Always ground your answers in the fetched wiki data. Do not invent facts not present in the retrieved content.',
+    'When you have gathered enough information, provide a clear, concise answer.',
+    'If no relevant content is found after searching, say so directly.',
+  ].join('\n');
+}
+
 export function parseLLMResponse(raw: string): LLMIngestResponse {
   let parsed: unknown;
 

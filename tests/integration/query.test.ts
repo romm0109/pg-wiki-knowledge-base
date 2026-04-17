@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { createClient, Client } from '../../src/index';
-import type { LLMAdapter } from '../../src/llm';
+import type { LLMAdapter, LLMToolRequest, LLMToolResponse } from '../../src/llm';
 import { Client as PgClient } from 'pg';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -515,7 +515,7 @@ describe('query integration', () => {
     });
   });
 
-  it('query rejects unsupported synthesize mode', async () => {
+  it('synthesize mode fails clearly without tool-capable adapter', async () => {
     if (!DATABASE_URL) {
       return;
     }
@@ -527,7 +527,269 @@ describe('query integration', () => {
 
     await expect(
       client.query('typescript', { mode: 'synthesize' })
-    ).rejects.toThrow('synthesize mode not implemented');
+    ).rejects.toThrow('synthesize mode requires a tool-capable llm adapter');
+  });
+
+  it('synthesize mode answers by using wiki_search then wiki_get_page', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const ingested = await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript. It adds static types to JS.',
+      type: 'text',
+    });
+
+    let searchResultPageId: string | null = null;
+    let toolCallCount = 0;
+
+    const toolAdapter: LLMAdapter = {
+      ...mockLlm,
+      async respondWithTools(req: LLMToolRequest): Promise<LLMToolResponse> {
+        toolCallCount++;
+
+        // First call: search
+        if (toolCallCount === 1) {
+          return {
+            toolCalls: [
+              { id: 'call-1', name: 'wiki_search', arguments: { text: 'typed superset' } },
+            ],
+          };
+        }
+
+        // Parse page id from previous search result
+        if (toolCallCount === 2) {
+          const toolMsg = req.messages.find((m) => m.role === 'tool');
+          if (toolMsg && toolMsg.role === 'tool') {
+            const result = JSON.parse(toolMsg.toolResults[0].content) as {
+              pages: { id: string }[];
+            };
+            searchResultPageId = result.pages[0]?.id ?? null;
+          }
+          return {
+            toolCalls: [
+              {
+                id: 'call-2',
+                name: 'wiki_get_page',
+                arguments: { id: searchResultPageId! },
+              },
+            ],
+          };
+        }
+
+        // Final answer
+        return { answer: 'TypeScript adds static types to JavaScript.' };
+      },
+    };
+
+    const synthesizeClient = await createClient({
+      connectionString: DATABASE_URL,
+      llm: toolAdapter,
+      migrations: { run: false },
+    });
+
+    try {
+      const result = await synthesizeClient.query('What does TypeScript add?', {
+        mode: 'synthesize',
+      });
+
+      expect(result.answer).toBeDefined();
+      expect(typeof result.answer).toBe('string');
+      expect(result.pages.length).toBeGreaterThanOrEqual(1);
+      expect(result.pages[0].id).toBe(ingested.pages[0].id);
+      expect(result.evidence.length).toBeGreaterThanOrEqual(1);
+      expect(toolCallCount).toBeGreaterThanOrEqual(2);
+    } finally {
+      await synthesizeClient.dataSource.destroy();
+    }
+  });
+
+  it('synthesize mode preserves tenant scope', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const tenantToolAdapter: LLMAdapter = {
+      ...mockLlm,
+      async respondWithTools(req: LLMToolRequest): Promise<LLMToolResponse> {
+        const isFirstTurn = !req.messages.some((m) => m.role === 'tool');
+        if (isFirstTurn) {
+          return {
+            toolCalls: [
+              { id: 'call-1', name: 'wiki_search', arguments: { text: 'content' } },
+            ],
+          };
+        }
+        const toolMsg = req.messages.find((m) => m.role === 'tool');
+        const content =
+          toolMsg && toolMsg.role === 'tool' ? toolMsg.toolResults[0].content : '{}';
+        const searchResult = JSON.parse(content) as { pages: { id: string; title: string }[] };
+        return {
+          answer: `Found: ${searchResult.pages.map((p) => p.title).join(', ')}`,
+        };
+      },
+    };
+
+    const tenantClient = await createClient<{ workspaceId: string }>({
+      connectionString: DATABASE_URL,
+      llm: tenantToolAdapter,
+      tenant: { key: 'workspaceId' },
+      migrations: { run: false },
+    });
+
+    try {
+      await tenantClient.ingestSource({
+        content: 'TenantAMarker content for tenant A synthesize test.',
+        type: 'text',
+        tenant: { workspaceId: 'a' },
+      });
+      await tenantClient.ingestSource({
+        content: 'TenantBMarker content for tenant B synthesize test.',
+        type: 'text',
+        tenant: { workspaceId: 'b' },
+      });
+
+      const result = await tenantClient.query('content', {
+        mode: 'synthesize',
+        tenant: { workspaceId: 'a' },
+      });
+
+      expect(result.answer).toContain('TenantA');
+      expect(result.answer).not.toContain('TenantB');
+      expect(result.pages.every((p) => p.title === 'TenantA')).toBe(true);
+    } finally {
+      await tenantClient.dataSource.destroy();
+    }
+  });
+
+  it('synthesize mode preserves metadata filters', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const filterToolAdapter: LLMAdapter = {
+      ...mockLlm,
+      async respondWithTools(req: LLMToolRequest): Promise<LLMToolResponse> {
+        const isFirstTurn = !req.messages.some((m) => m.role === 'tool');
+        if (isFirstTurn) {
+          return {
+            toolCalls: [
+              { id: 'call-1', name: 'wiki_search', arguments: { text: 'page content' } },
+            ],
+          };
+        }
+        const toolMsg = req.messages.find((m) => m.role === 'tool');
+        const content =
+          toolMsg && toolMsg.role === 'tool' ? toolMsg.toolResults[0].content : '{}';
+        const searchResult = JSON.parse(content) as { pages: { id: string; title: string }[] };
+        return {
+          answer: `Found: ${searchResult.pages.map((p) => p.title).join(', ')}`,
+        };
+      },
+    };
+
+    const filterClient = await createClient({
+      connectionString: DATABASE_URL,
+      llm: filterToolAdapter,
+      migrations: { run: false },
+    });
+
+    try {
+      const billing = await filterClient.ingestSource({
+        content: 'BillingMarker shared content for synthesize filter test.',
+        type: 'text',
+      });
+      const support = await filterClient.ingestSource({
+        content: 'SupportMarker shared content for synthesize filter test.',
+        type: 'text',
+      });
+
+      await updatePageMetadata(filterClient, billing.pages[0].id, { project: 'billing' });
+      await updatePageMetadata(filterClient, support.pages[0].id, { project: 'support' });
+
+      const result = await filterClient.query('shared content', {
+        mode: 'synthesize',
+        filters: { project: 'billing' },
+      });
+
+      expect(result.answer).toContain('Billing');
+      expect(result.answer).not.toContain('Support');
+      expect(result.pages.every((p) => p.title === 'Billing')).toBe(true);
+    } finally {
+      await filterClient.dataSource.destroy();
+    }
+  });
+
+  it('synthesize mode fails on excessive tool steps', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript.',
+      type: 'text',
+    });
+
+    const loopingAdapter: LLMAdapter = {
+      ...mockLlm,
+      async respondWithTools(): Promise<LLMToolResponse> {
+        return {
+          toolCalls: [
+            { id: 'call-loop', name: 'wiki_search', arguments: { text: 'typescript' } },
+          ],
+        };
+      },
+    };
+
+    const loopClient = await createClient({
+      connectionString: DATABASE_URL,
+      llm: loopingAdapter,
+      migrations: { run: false },
+    });
+
+    try {
+      await expect(
+        loopClient.query('typescript', { mode: 'synthesize' })
+      ).rejects.toThrow('exceeded maximum tool steps');
+    } finally {
+      await loopClient.dataSource.destroy();
+    }
+  });
+
+  it('synthesize mode rejects malformed tool calls', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript.',
+      type: 'text',
+    });
+
+    const badToolAdapter: LLMAdapter = {
+      ...mockLlm,
+      async respondWithTools(): Promise<LLMToolResponse> {
+        return {
+          toolCalls: [
+            { id: 'call-bad', name: 'wiki_unknown_tool', arguments: {} },
+          ],
+        };
+      },
+    };
+
+    const badClient = await createClient({
+      connectionString: DATABASE_URL,
+      llm: badToolAdapter,
+      migrations: { run: false },
+    });
+
+    try {
+      await expect(
+        badClient.query('typescript', { mode: 'synthesize' })
+      ).rejects.toThrow('unknown tool');
+    } finally {
+      await badClient.dataSource.destroy();
+    }
   });
 });
 

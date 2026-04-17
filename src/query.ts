@@ -186,12 +186,8 @@ function validateListPagesOptions(limit?: number, offset?: number): void {
   }
 }
 
-function resolveQueryMode(mode?: QueryMode): 'pages-only' {
-  if (mode === 'synthesize') {
-    throw new Error('synthesize mode not implemented');
-  }
-
-  return 'pages-only';
+function resolveQueryMode(mode?: QueryMode): QueryMode {
+  return mode ?? 'pages-only';
 }
 
 function validateQueryText(text: string): string {
@@ -335,14 +331,11 @@ export async function getPage<TTenant extends Record<string, unknown> = never>(
   };
 }
 
-export async function query<TTenant extends Record<string, unknown> = never>(
+export async function runPagesOnlyQuery<TTenant extends Record<string, unknown> = never>(
   ctx: QueryContext<TTenant>,
   text: string,
   opts: QueryOpts<TTenant>
 ): Promise<QueryResult> {
-  const normalizedText = validateQueryText(text);
-  resolveQueryMode(opts.mode);
-
   const tenantValue = resolveTenantValue(ctx.config, opts);
   const manager = ctx.dataSource.manager;
   const tsQuery = `websearch_to_tsquery('english', :text)`;
@@ -353,7 +346,7 @@ export async function query<TTenant extends Record<string, unknown> = never>(
     .addSelect('p.title', 'title')
     .addSelect('p.content', 'content')
     .addSelect(`ts_rank_cd(p.search_vector, ${tsQuery})`, 'rank')
-    .where(`p.search_vector @@ ${tsQuery}`, { text: normalizedText });
+    .where(`p.search_vector @@ ${tsQuery}`, { text });
 
   pageQuery = applyPageTenantScope(pageQuery, tenantValue);
   pageQuery = applyMetadataFilters(pageQuery, opts.filters);
@@ -403,8 +396,24 @@ export async function query<TTenant extends Record<string, unknown> = never>(
     ).values()
   );
 
-  return {
-    pages,
-    evidence,
-  };
+  return { pages, evidence };
+}
+
+export async function query<TTenant extends Record<string, unknown> = never>(
+  ctx: QueryContext<TTenant>,
+  text: string,
+  opts: QueryOpts<TTenant>
+): Promise<QueryResult> {
+  const normalizedText = validateQueryText(text);
+  const mode = resolveQueryMode(opts.mode);
+
+  if (mode === 'synthesize') {
+    if (!ctx.config.llm.respondWithTools) {
+      throw new Error('synthesize mode requires a tool-capable llm adapter');
+    }
+    const { runSynthesizeQueryAgent } = await import('./query-agent');
+    return runSynthesizeQueryAgent(ctx, normalizedText, opts);
+  }
+
+  return runPagesOnlyQuery(ctx, normalizedText, opts);
 }

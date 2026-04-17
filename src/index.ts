@@ -9,4 +9,13 @@ export type {
   PageSummary,
   PageDetail,
 } from './types';
-export type { LLMAdapter, EmbeddingAdapter } from './llm';
+export type {
+  LLMAdapter,
+  EmbeddingAdapter,
+  LLMToolDefinition,
+  LLMToolCall,
+  LLMToolResult,
+  LLMMessage,
+  LLMToolRequest,
+  LLMToolResponse,
+} from './llm';
