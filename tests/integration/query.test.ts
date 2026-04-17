@@ -5,38 +5,38 @@ import { Client as PgClient } from 'pg';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
+function resolveMockTitle(prompt: string): string {
+  const markerMatch = prompt.match(/\b([A-Za-z]+)Marker\b/);
+  return markerMatch?.[1] ?? 'TypeScript';
+}
+
 const mockLlm: LLMAdapter = {
   async complete(prompt: string): Promise<string> {
-    if (prompt.includes('Updated details')) {
-      return JSON.stringify({
-        pages: [
-          {
-            title: 'TypeScript',
-            type: 'concept',
-            content: 'TypeScript is a typed superset of JavaScript. Updated details.',
-            changeSummary: 'Updated summary',
-            claims: [
-              {
-                text: 'TypeScript adds static types to JavaScript.',
-                status: 'verified',
-              },
-            ],
-            links: [],
-          },
-        ],
-      });
-    }
+    const title = resolveMockTitle(prompt);
+    const isUpdated = prompt.includes('Updated details');
+    const content =
+      title === 'TypeScript'
+        ? isUpdated
+          ? 'TypeScript is a typed superset of JavaScript. Updated details.'
+          : 'TypeScript is a typed superset of JavaScript.'
+        : isUpdated
+          ? `${title} page content. Updated details.`
+          : `${title} page content.`;
+    const claimText =
+      title === 'TypeScript'
+        ? 'TypeScript adds static types to JavaScript.'
+        : `${title} page claim.`;
 
     return JSON.stringify({
       pages: [
         {
-          title: 'TypeScript',
+          title,
           type: 'concept',
-          content: 'TypeScript is a typed superset of JavaScript.',
-          changeSummary: 'Initial version',
+          content,
+          changeSummary: isUpdated ? 'Updated summary' : 'Initial version',
           claims: [
             {
-              text: 'TypeScript adds static types to JavaScript.',
+              text: claimText,
               status: 'verified',
             },
           ],
@@ -163,6 +163,132 @@ describe('query integration', () => {
     ).rejects.toThrow('Page not found');
   });
 
+  it('listPages returns page summaries', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    await client.ingestSource({
+      content: 'TypeScript is a typed superset of JavaScript.',
+      type: 'text',
+    });
+
+    const pages = await client.listPages({});
+
+    expect(Array.isArray(pages)).toBe(true);
+    expect(pages).toHaveLength(1);
+    expect(pages[0]).toMatchObject({
+      id: expect.any(String),
+      title: 'TypeScript',
+      type: 'concept',
+      status: 'published',
+      metadata: {},
+    });
+  });
+
+  it('listPages applies exact metadata filters', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const billing = await client.ingestSource({
+      content: 'BillingMarker content for billing workflows.',
+      type: 'text',
+    });
+    const support = await client.ingestSource({
+      content: 'SupportMarker content for support workflows.',
+      type: 'text',
+    });
+
+    await updatePageMetadata(client, billing.pages[0].id, { project: 'billing' });
+    await updatePageMetadata(client, support.pages[0].id, { project: 'support' });
+
+    const pages = await client.listPages({
+      filters: { project: 'billing' },
+    });
+
+    expect(pages).toHaveLength(1);
+    expect(pages[0]).toMatchObject({
+      id: billing.pages[0].id,
+      title: 'Billing',
+      metadata: { project: 'billing' },
+    });
+  });
+
+  it('listPages applies $in and $nin metadata filters', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const billing = await client.ingestSource({
+      content: 'BillingMarker content for billing workflows.',
+      type: 'text',
+    });
+    const support = await client.ingestSource({
+      content: 'SupportMarker content for support workflows.',
+      type: 'text',
+    });
+    const internal = await client.ingestSource({
+      content: 'InternalMarker content for internal workflows.',
+      type: 'text',
+    });
+
+    await updatePageMetadata(client, billing.pages[0].id, { project: 'billing' });
+    await updatePageMetadata(client, support.pages[0].id, { project: 'support' });
+    await updatePageMetadata(client, internal.pages[0].id, { project: 'internal' });
+
+    const includedPages = await client.listPages({
+      filters: { project: { $in: ['billing', 'support'] } },
+    });
+    const excludedPages = await client.listPages({
+      filters: { project: { $nin: ['internal'] } },
+    });
+    const emptyInPages = await client.listPages({
+      filters: { project: { $in: [] } },
+    });
+    const emptyNinPages = await client.listPages({
+      filters: { project: { $nin: [] } },
+    });
+
+    expect(includedPages.map((page) => page.title)).toEqual(['Billing', 'Support']);
+    expect(excludedPages.map((page) => page.title)).toEqual(['Billing', 'Support']);
+    expect(emptyInPages).toEqual([]);
+    expect(emptyNinPages.map((page) => page.title)).toEqual([
+      'Billing',
+      'Internal',
+      'Support',
+    ]);
+  });
+
+  it('listPages treats null filters as missing key or explicit null', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const explicitNull = await client.ingestSource({
+      content: 'NullMarker content for explicit null metadata.',
+      type: 'text',
+    });
+    const missing = await client.ingestSource({
+      content: 'MissingMarker content for missing metadata.',
+      type: 'text',
+    });
+    const billing = await client.ingestSource({
+      content: 'BillingMarker content for billing workflows.',
+      type: 'text',
+    });
+
+    await updatePageMetadata(client, explicitNull.pages[0].id, { project: null });
+    await updatePageMetadata(client, missing.pages[0].id, {});
+    await updatePageMetadata(client, billing.pages[0].id, { project: 'billing' });
+
+    const pages = await client.listPages({
+      filters: { project: null },
+    });
+
+    expect(pages.map((page) => page.title)).toEqual(['Missing', 'Null']);
+  });
+
   it('getPage enforces tenant scope', async () => {
     if (!DATABASE_URL) {
       return;
@@ -196,7 +322,87 @@ describe('query integration', () => {
       await tenantClient.dataSource.destroy();
     }
   });
+
+  it('listPages enforces tenant scope', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const tenantClient = await createClient<{ workspaceId: string }>({
+      connectionString: DATABASE_URL,
+      llm: mockLlm,
+      tenant: { key: 'workspaceId' },
+      migrations: { run: false },
+    });
+
+    try {
+      await tenantClient.ingestSource({
+        content: 'TenantAMarker content for tenant A.',
+        type: 'text',
+        tenant: { workspaceId: 'a' },
+      });
+      await tenantClient.ingestSource({
+        content: 'TenantBMarker content for tenant B.',
+        type: 'text',
+        tenant: { workspaceId: 'b' },
+      });
+
+      const tenantAPages = await tenantClient.listPages({
+        tenant: { workspaceId: 'a' },
+      });
+
+      expect(tenantAPages.map((page) => page.title)).toEqual(['TenantA']);
+    } finally {
+      await tenantClient.dataSource.destroy();
+    }
+  });
+
+  it('listPages applies deterministic pagination and validates inputs', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    await client.ingestSource({
+      content: 'AlphaMarker content for ordering.',
+      type: 'text',
+    });
+    await client.ingestSource({
+      content: 'BravoMarker content for ordering.',
+      type: 'text',
+    });
+    await client.ingestSource({
+      content: 'CharlieMarker content for ordering.',
+      type: 'text',
+    });
+
+    const firstPage = await client.listPages({ limit: 2, offset: 0 });
+    const secondPage = await client.listPages({ limit: 2, offset: 2 });
+
+    expect(firstPage.map((page) => page.title)).toEqual(['Alpha', 'Bravo']);
+    expect(secondPage.map((page) => page.title)).toEqual(['Charlie']);
+
+    await expect(client.listPages({ limit: 0 })).rejects.toThrow(
+      'Invalid pagination options'
+    );
+    await expect(client.listPages({ offset: -1 })).rejects.toThrow(
+      'Invalid pagination options'
+    );
+    await expect(
+      client.listPages({ limit: 1.5 } as { limit: number })
+    ).rejects.toThrow('Invalid pagination options');
+  });
 });
+
+async function updatePageMetadata(
+  client: Client,
+  pageId: string,
+  metadata: Record<string, unknown>
+): Promise<void> {
+  await client.dataSource.query(
+    'UPDATE pgwiki_wiki_pages SET metadata = $2::jsonb WHERE id = $1',
+    [pageId, JSON.stringify(metadata)]
+  );
+}
 
 async function clearPgwikiTables(client: Client): Promise<void> {
   const tables = [

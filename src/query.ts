@@ -1,4 +1,4 @@
-import { DataSource, SelectQueryBuilder } from 'typeorm';
+import { Brackets, DataSource, SelectQueryBuilder } from 'typeorm';
 import {
   WikiPage,
   WikiPageVersion,
@@ -7,7 +7,7 @@ import {
   SourceFragment,
   Source,
 } from './entities';
-import type { ClientConfig, PageDetail } from './types';
+import type { ClientConfig, MetadataFilters, PageDetail, PageSummary } from './types';
 
 export interface QueryContext<TTenant extends Record<string, unknown> = never> {
   dataSource: DataSource;
@@ -18,6 +18,13 @@ export interface QueryContext<TTenant extends Record<string, unknown> = never> {
 type TenantOpts<TTenant extends Record<string, unknown>> = [TTenant] extends [never]
   ? {}
   : { tenant: TTenant };
+
+type ListPagesOpts<TTenant extends Record<string, unknown>> =
+  TenantOpts<TTenant> & {
+    filters?: MetadataFilters;
+    limit?: number;
+    offset?: number;
+  };
 
 type TenantValue = Record<string, unknown> | null;
 
@@ -41,6 +48,148 @@ function applyPageTenantScope(
   }
 
   return queryBuilder.andWhere('p.tenant IS NULL');
+}
+
+function isInFilter(value: unknown): value is { $in: unknown[] } {
+  return typeof value === 'object' && value !== null && '$in' in value;
+}
+
+function isNinFilter(value: unknown): value is { $nin: unknown[] } {
+  return typeof value === 'object' && value !== null && '$nin' in value;
+}
+
+function applyMetadataFilters(
+  queryBuilder: SelectQueryBuilder<WikiPage>,
+  filters?: MetadataFilters
+): SelectQueryBuilder<WikiPage> {
+  if (!filters) {
+    return queryBuilder;
+  }
+
+  const entries = Object.entries(filters);
+  for (const [index, [key, value]] of entries.entries()) {
+    if (value === null) {
+      const metadataKeyParam = `metadataKey${index}`;
+      const metadataNullParam = `metadataNull${index}`;
+
+      queryBuilder.andWhere(
+        new Brackets((qb) => {
+          qb.where(`NOT (p.metadata ? :${metadataKeyParam})`, {
+            [metadataKeyParam]: key,
+          }).orWhere(`p.metadata @> :${metadataNullParam}::jsonb`, {
+            [metadataNullParam]: JSON.stringify({ [key]: null }),
+          });
+        })
+      );
+      continue;
+    }
+
+    if (isInFilter(value)) {
+      if (value.$in.length === 0) {
+        queryBuilder.andWhere('1 = 0');
+        continue;
+      }
+
+      queryBuilder.andWhere(
+        new Brackets((qb) => {
+          value.$in.forEach((entry, entryIndex) => {
+            const paramName = `metadataIn${index}_${entryIndex}`;
+            const clause = `p.metadata @> :${paramName}::jsonb`;
+            const params = {
+              [paramName]: JSON.stringify({ [key]: entry }),
+            };
+
+            if (entryIndex === 0) {
+              qb.where(clause, params);
+              return;
+            }
+
+            qb.orWhere(clause, params);
+          });
+        })
+      );
+      continue;
+    }
+
+    if (isNinFilter(value)) {
+      if (value.$nin.length === 0) {
+        continue;
+      }
+
+      queryBuilder.andWhere(
+        new Brackets((qb) => {
+          value.$nin.forEach((entry, entryIndex) => {
+            const paramName = `metadataNin${index}_${entryIndex}`;
+            const clause = `NOT (p.metadata @> :${paramName}::jsonb)`;
+            const params = {
+              [paramName]: JSON.stringify({ [key]: entry }),
+            };
+
+            if (entryIndex === 0) {
+              qb.where(clause, params);
+              return;
+            }
+
+            qb.andWhere(clause, params);
+          });
+        })
+      );
+      continue;
+    }
+
+    const paramName = `metadataExact${index}`;
+    queryBuilder.andWhere(`p.metadata @> :${paramName}::jsonb`, {
+      [paramName]: JSON.stringify({ [key]: value }),
+    });
+  }
+
+  return queryBuilder;
+}
+
+function validateListPagesOptions(limit?: number, offset?: number): void {
+  const hasInvalidLimit =
+    limit !== undefined && (!Number.isInteger(limit) || limit < 1);
+  const hasInvalidOffset =
+    offset !== undefined && (!Number.isInteger(offset) || offset < 0);
+
+  if (hasInvalidLimit || hasInvalidOffset) {
+    throw new Error('Invalid pagination options');
+  }
+}
+
+export async function listPages<TTenant extends Record<string, unknown> = never>(
+  ctx: QueryContext<TTenant>,
+  opts: ListPagesOpts<TTenant>
+): Promise<PageSummary[]> {
+  validateListPagesOptions(opts.limit, opts.offset);
+
+  const tenantValue = resolveTenantValue(ctx.config, opts);
+  const manager = ctx.dataSource.manager;
+
+  let pageQuery = manager
+    .createQueryBuilder(WikiPage, 'p')
+    .select(['p.id', 'p.title', 'p.type', 'p.status', 'p.metadata']);
+
+  pageQuery = applyPageTenantScope(pageQuery, tenantValue);
+  pageQuery = applyMetadataFilters(pageQuery, opts.filters);
+  pageQuery = pageQuery.orderBy('p.title', 'ASC').addOrderBy('p.id', 'ASC');
+
+  if (opts.limit !== undefined) {
+    pageQuery = pageQuery.take(opts.limit);
+  }
+
+  if (opts.offset !== undefined) {
+    pageQuery = pageQuery.skip(opts.offset);
+  }
+
+  const pages = await pageQuery.getMany();
+  return pages.map((page) => ({
+    id: page.id,
+    title: page.title,
+    type: page.type,
+    status: page.status,
+    metadata: page.metadata ?? {},
+  }));
 }
 
 export async function getPage<TTenant extends Record<string, unknown> = never>(
