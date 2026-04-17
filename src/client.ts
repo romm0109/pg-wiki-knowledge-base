@@ -12,9 +12,9 @@ import {
   JobEvent,
 } from './entities';
 import { InitialSchema1700000000000 } from './migrations/1700000000000-InitialSchema';
+import { deleteSource, ingestSource, IngestContext } from './ingest';
 import type {
   ClientConfig,
-  WithTenant,
   MetadataFilters,
   IngestResult,
   DeleteResult,
@@ -23,13 +23,19 @@ import type {
   PageDetail,
 } from './types';
 
+type TenantArg<TTenant extends Record<string, unknown>> = [TTenant] extends [never]
+  ? {}
+  : { tenant: TTenant };
+
 export class Client<TTenant extends Record<string, unknown> = never> {
   readonly dataSource: DataSource;
   readonly schema: string;
+  private readonly _config: ClientConfig<TTenant>;
 
-  constructor(dataSource: DataSource, schema: string) {
+  constructor(dataSource: DataSource, schema: string, config: ClientConfig<TTenant>) {
     this.dataSource = dataSource;
     this.schema = schema;
+    this._config = config;
   }
 
   async ingestSource(
@@ -37,19 +43,26 @@ export class Client<TTenant extends Record<string, unknown> = never> {
       content: string;
       type: 'text' | 'markdown' | 'html' | 'pdf' | 'url' | 'record';
       metadata?: Record<string, unknown>;
-    } & WithTenant<TTenant>
+    } & TenantArg<TTenant>
   ): Promise<IngestResult> {
-    void source;
-    throw new Error('not implemented');
+    const ctx: IngestContext<TTenant> = {
+      dataSource: this.dataSource,
+      schema: this.schema,
+      config: this._config,
+    };
+    return ingestSource(ctx, source);
   }
 
   async deleteSource(
     id: string,
-    opts: WithTenant<TTenant>
+    opts: TenantArg<TTenant>
   ): Promise<DeleteResult> {
-    void id;
-    void opts;
-    throw new Error('not implemented');
+    const ctx: IngestContext<TTenant> = {
+      dataSource: this.dataSource,
+      schema: this.schema,
+      config: this._config,
+    };
+    return deleteSource(ctx, id, opts);
   }
 
   async query(
@@ -57,7 +70,7 @@ export class Client<TTenant extends Record<string, unknown> = never> {
     opts: {
       filters?: MetadataFilters;
       mode?: 'pages-only' | 'synthesize';
-    } & WithTenant<TTenant>
+    } & TenantArg<TTenant>
   ): Promise<QueryResult> {
     void text;
     void opts;
@@ -67,7 +80,7 @@ export class Client<TTenant extends Record<string, unknown> = never> {
   async listPages(
     opts: {
       filters?: MetadataFilters;
-    } & WithTenant<TTenant>
+    } & TenantArg<TTenant>
   ): Promise<PageSummary[]> {
     void opts;
     throw new Error('not implemented');
@@ -75,7 +88,7 @@ export class Client<TTenant extends Record<string, unknown> = never> {
 
   async getPage(
     id: string,
-    opts: WithTenant<TTenant>
+    opts: TenantArg<TTenant>
   ): Promise<PageDetail> {
     void id;
     void opts;
@@ -116,5 +129,5 @@ export async function createClient<TTenant extends Record<string, unknown> = nev
     await dataSource.runMigrations();
   }
 
-  return new Client<TTenant>(dataSource, schema);
+  return new Client<TTenant>(dataSource, schema, config);
 }

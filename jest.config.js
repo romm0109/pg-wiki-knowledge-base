@@ -2,6 +2,7 @@
 const config = {
   testEnvironment: 'node',
   testMatch: ['**/tests/**/*.test.ts'],
+  maxWorkers: 1,
   transform: {
     '^.+\\.tsx?$': ['ts-jest', { tsconfig: 'tsconfig.json' }],
   },

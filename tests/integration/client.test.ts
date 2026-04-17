@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { createClient, Client } from '../../src/index';
 import type { LLMAdapter } from '../../src/llm';
+import { Client as PgClient } from 'pg';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -29,6 +30,7 @@ describe('createClient integration', () => {
     if (!DATABASE_URL) {
       return;
     }
+    await dropExistingTables(DATABASE_URL);
     client = await createClient({ connectionString: DATABASE_URL, llm: mockLlm });
   });
 
@@ -145,3 +147,29 @@ describe('createClient integration', () => {
     await client3.dataSource.destroy();
   });
 });
+
+async function dropExistingTables(connectionString: string): Promise<void> {
+  const pg = new PgClient({ connectionString });
+  await pg.connect();
+
+  try {
+    const tables = [
+      'pgwiki_job_events',
+      'pgwiki_jobs',
+      'pgwiki_claim_evidence',
+      'pgwiki_wiki_claims',
+      'pgwiki_wiki_links',
+      'pgwiki_wiki_page_versions',
+      'pgwiki_wiki_pages',
+      'pgwiki_source_fragments',
+      'pgwiki_sources',
+      'typeorm_migrations',
+    ];
+
+    for (const table of tables) {
+      await pg.query(`DROP TABLE IF EXISTS "${table}" CASCADE`);
+    }
+  } finally {
+    await pg.end();
+  }
+}
