@@ -35,6 +35,36 @@ const successLlm: LLMAdapter = {
       });
     }
 
+    if (prompt.includes('ConflictTestV2')) {
+      return JSON.stringify({
+        pages: [
+          {
+            title: 'ConflictPage',
+            type: 'concept',
+            content: 'ConflictPage version two content.',
+            changeSummary: 'Second version',
+            claims: [],
+            links: [],
+          },
+        ],
+      });
+    }
+
+    if (prompt.includes('ConflictTest')) {
+      return JSON.stringify({
+        pages: [
+          {
+            title: 'ConflictPage',
+            type: 'concept',
+            content: 'ConflictPage version one content.',
+            changeSummary: 'Initial version',
+            claims: [],
+            links: [],
+          },
+        ],
+      });
+    }
+
     return JSON.stringify({
       pages: [
         {
@@ -318,6 +348,78 @@ describe('ingest integration', () => {
     await expect(
       client.deleteSource('00000000-0000-0000-0000-000000000000', {})
     ).rejects.toThrow('Source not found');
+  });
+
+  it('conflictResolution flag (default) marks page as conflicted on content change', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    // client has no conflictResolution set — defaults to flag behavior
+    await client.ingestSource({ content: 'ConflictTest initial', type: 'text' });
+    const second = await client.ingestSource({ content: 'ConflictTestV2 changed', type: 'text' });
+
+    expect(second.pages).toHaveLength(1);
+    expect(second.pages[0].action).toBe('updated');
+
+    const pages = await client.listPages({});
+    const conflictPage = pages.find((p) => p.title === 'ConflictPage');
+    expect(conflictPage).toBeDefined();
+    expect(conflictPage!.status).toBe('conflicted');
+
+    const events = await client.dataSource.query<{ type: string; data: Record<string, unknown> }[]>(
+      "SELECT type, data FROM pgwiki_job_events WHERE type = 'conflict'"
+    );
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(events[0].data).toMatchObject({ pageId: conflictPage!.id });
+  });
+
+  it('conflictResolution auto-resolve publishes updated page normally', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    const autoClient = await createClient({
+      connectionString: DATABASE_URL!,
+      llm: successLlm,
+      conflictResolution: 'auto-resolve',
+      migrations: { run: false },
+    });
+
+    try {
+      await autoClient.ingestSource({ content: 'ConflictTest initial', type: 'text' });
+      const second = await autoClient.ingestSource({ content: 'ConflictTestV2 changed', type: 'text' });
+
+      expect(second.pages[0].action).toBe('updated');
+
+      const pages = await autoClient.listPages({});
+      const conflictPage = pages.find((p) => p.title === 'ConflictPage');
+      expect(conflictPage).toBeDefined();
+      expect(conflictPage!.status).toBe('published');
+    } finally {
+      await autoClient.dataSource.destroy();
+    }
+  });
+
+  it('re-ingesting identical content clears conflicted status', async () => {
+    if (!DATABASE_URL) {
+      return;
+    }
+
+    // First: get the page to conflicted state
+    await client.ingestSource({ content: 'ConflictTest initial', type: 'text' });
+    await client.ingestSource({ content: 'ConflictTestV2 changed', type: 'text' });
+
+    const pagesAfterConflict = await client.listPages({});
+    const conflicted = pagesAfterConflict.find((p) => p.title === 'ConflictPage');
+    expect(conflicted!.status).toBe('conflicted');
+
+    // Re-ingest the same V2 content — no change, should resolve conflict
+    await client.ingestSource({ content: 'ConflictTestV2 changed', type: 'text' });
+
+    const pagesAfterResolve = await client.listPages({});
+    const resolved = pagesAfterResolve.find((p) => p.title === 'ConflictPage');
+    expect(resolved!.status).toBe('published');
   });
 });
 

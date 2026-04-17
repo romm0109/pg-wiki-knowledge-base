@@ -123,7 +123,7 @@ export async function ingestSource<TTenant extends Record<string, unknown> = nev
       const normalizedTitle = pageAction.title.toLocaleLowerCase();
       const existingPage = pageByNormalizedTitle.get(normalizedTitle);
       const page = existingPage
-        ? await updateExistingPage(queryRunner, existingPage, pageAction)
+        ? await updateExistingPage(queryRunner, existingPage, pageAction, ctx.config.conflictResolution)
         : await createNewPage(queryRunner, pageAction, tenantValue);
 
       await syncClaims(queryRunner, page, pageAction, fragments);
@@ -141,6 +141,14 @@ export async function ingestSource<TTenant extends Record<string, unknown> = nev
         data: { pageId: page.id, action: existingPage ? 'updated' : 'created' },
         job,
       });
+
+      if (page.status === 'conflicted') {
+        await queryRunner.manager.save(JobEvent, {
+          type: 'conflict',
+          data: { pageId: page.id },
+          job,
+        });
+      }
     }
 
     for (const page of affectedPages) {
@@ -308,21 +316,28 @@ async function createNewPage(
 async function updateExistingPage(
   queryRunner: ReturnType<DataSource['createQueryRunner']>,
   existingPage: WikiPage,
-  pageAction: LLMPageAction
+  pageAction: LLMPageAction,
+  conflictResolution: 'flag' | 'auto-resolve' | undefined
 ): Promise<WikiPage> {
+  const contentChanged = existingPage.content !== pageAction.content;
+
   const version = await queryRunner.manager.save(WikiPageVersion, {
     content: existingPage.content,
-    changeSummary:
-      existingPage.content !== pageAction.content
-        ? (pageAction.changeSummary ?? 'Updated')
-        : 'No change',
+    changeSummary: contentChanged ? (pageAction.changeSummary ?? 'Updated') : 'No change',
     page: existingPage,
   });
 
   existingPage.content = pageAction.content;
   existingPage.type = pageAction.type;
-  existingPage.status = 'published';
   existingPage.currentVersionId = version.id;
+
+  if (!contentChanged) {
+    existingPage.status = 'published';
+  } else if (conflictResolution === 'auto-resolve') {
+    existingPage.status = 'published';
+  } else {
+    existingPage.status = 'conflicted';
+  }
 
   return queryRunner.manager.save(WikiPage, existingPage);
 }
